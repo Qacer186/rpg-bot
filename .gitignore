@@ -1,0 +1,5 @@
+.env
+rpg.db
+__pycache__/
+venv/
+*.log
