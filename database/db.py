@@ -4,7 +4,7 @@ DB_NAME = "rpg.db"
 
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        # Tabela użytkowników (już ją masz, upewnij się, że jest kompletna)
+        # Tabela użytkowników
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +42,7 @@ async def init_db():
         )
         """)
 
-        # Dodajemy przykładowe przedmioty, jeśli ich nie ma
+        # Dodawanie przykładowych przedmiotów, jeśli ich nie ma
         await db.execute("INSERT OR IGNORE INTO items (id, name, price, atk_bonus, def_bonus) VALUES (1, 'Drewniany Miecz', 30, 3, 0)")
         await db.execute("INSERT OR IGNORE INTO items (id, name, price, atk_bonus, def_bonus) VALUES (2, 'Skórzana Tunika', 30, 0, 2)")
         await db.execute("INSERT OR IGNORE INTO items (id, name, price, atk_bonus, def_bonus) VALUES (3, 'Żelazny Miecz', 120, 10, 0)")
@@ -53,9 +53,14 @@ async def init_db():
 # Funkcje pomocnicze do ekwipunku
 async def buy_item(discord_id: str, item_id: int, price: int):
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET gold = gold - ? WHERE discord_id = ?", (price, discord_id))
-        await db.execute("INSERT INTO inventory (user_id, item_id) VALUES (?, ?)", (discord_id, item_id))
-        await db.commit()
+        try:
+            await db.execute("BEGIN")
+            await db.execute("UPDATE users SET gold = gold - ? WHERE discord_id = ?", (price, discord_id))
+            await db.execute("INSERT INTO inventory (user_id, item_id) VALUES (?, ?)", (discord_id, item_id))
+            await db.commit() # Zatwierdzanie obu zmian naraz
+        except Exception as e:
+            await db.rollback() # Cofnięcie zmian w przypadku błędu
+            raise e
 
 async def get_user_inventory(discord_id: str):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -81,7 +86,6 @@ async def get_leaderboard(limit: int = 10):
 
 async def create_user(discord_id: str):
     async with aiosqlite.connect(DB_NAME) as db:
-        # Wystarczy podać discord_id, reszta uzupełni się sama (DEFAULT)
         await db.execute("""
         INSERT OR IGNORE INTO users (discord_id)
         VALUES (?)
@@ -137,7 +141,7 @@ async def toggle_equip_item(user_id: str, item_name: str):
 
 async def update_user_after_fight(discord_id: str, hp: int, exp: int, gold: int, stamina: int):
     async with aiosqlite.connect(DB_NAME) as db:
-        # Aktualizujemy statystyki po walce
+        # Aktualizacja statystyk po walce
         await db.execute("""
             UPDATE users 
             SET hp = ?, exp = ?, gold = gold + ?, stamina = ?

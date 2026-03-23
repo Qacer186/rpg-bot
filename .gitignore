@@ -3,3 +3,6 @@ rpg.db
 __pycache__/
 venv/
 *.log
+venv/
+.venv/
+.pytest_cache/

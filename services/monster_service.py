@@ -5,23 +5,23 @@ API_URL = "https://www.dnd5eapi.co/api/monsters"
 
 async def get_random_monster():
     async with aiohttp.ClientSession() as session:
-        # 1. Pobieramy listę wszystkich potworów
+        # Pobieranie listy wszystkich potworów
         async with session.get(API_URL) as response:
             if response.status != 200:
                 return None
             data = await response.json()
             all_monsters = data['results']
             
-        # 2. Losujemy jednego potwora z listy
+        # Losowanie jednego potwora z listy
         random_monster = random.choice(all_monsters)
         
-        # 3. Pobieramy szczegóły wybranego potwora
+        # Pobieranie szczegółów wybranego potwora
         async with session.get(f"https://www.dnd5eapi.co{random_monster['url']}") as response:
             if response.status != 200:
                 return None
             details = await response.json()
             
-            # Mapujemy dane z API na nasz system walki
+            # Mapowanie danych z API na nasz system walki
             return {
                 "name": details.get("name", "Nieznany Potwór"),
                 "hp": details.get("hit_points", 50),

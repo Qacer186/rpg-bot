@@ -58,7 +58,7 @@ class RPGCog(commands.Cog):
             monster = {"name": "Zły Cień", "hp": 30, "attack": 5, "gold": 10, "image": None}
 
         # --- RABBITMQ LOGIC ---
-        # Wysyłamy info o walce do kolejki (Punkt 5 planu)
+        # Wysyłanie info o walce do kolejki
         fight_log = {
             "user_id": user['discord_id'],
             "monster_name": monster['name'],

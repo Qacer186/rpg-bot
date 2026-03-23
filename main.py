@@ -5,7 +5,7 @@ import logging
 from dotenv import load_dotenv
 from database.db import init_db
 
-# Konfiguracja logowania (Punkt 7 Twojego planu)
+# Konfiguracja logowania
 if not os.path.exists('logs'):
     os.makedirs('logs')
 
@@ -30,16 +30,15 @@ class RpgBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # 1. Inicjalizacja bazy
         await init_db()
         
-        # 2. Automatyczne ładowanie Cogs z folderu commands/
+        # Automatyczne ładowanie Cogs z folderu commands/
         for filename in os.listdir('./commands'):
             if filename.endswith('.py'):
                 await self.load_extension(f'commands.{filename[:-3]}')
                 logger.info(f'Załadowano moduł: {filename}')
 
-        # 3. Synchronizacja komend dla Twojego serwera
+        # Synchronizacja komend dla serwera
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         synced = await self.tree.sync(guild=guild)

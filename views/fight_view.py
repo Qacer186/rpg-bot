@@ -13,14 +13,14 @@ class FightView(discord.ui.View):
 
     @discord.ui.button(label="⚔️ Atakuj", style=discord.ButtonStyle.danger)
     async def attack(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 1. Pobieramy bonusy z założonego ekwipunku (centralna logika w database/db.py)
+        # Pobieranie bonusów z założonego ekwipunku (centralna logika w database/db.py)
         bonuses = await get_equipped_bonuses(self.user['discord_id'])
 
         # Obsługa przypadku, gdy SUM zwraca None (brak przedmiotów)
         atk_bonus = bonuses['total_atk'] if bonuses and bonuses['total_atk'] else 0
         def_bonus = bonuses['total_def'] if bonuses and bonuses['total_def'] else 0
 
-        # 2. Atak gracza: baza + bonus z broni +/- losowość
+        # Atak gracza: baza + bonus z broni +/- losowość
         dmg = random.randint(
             self.user['attack'] + atk_bonus - 2, 
             self.user['attack'] + atk_bonus + 5
@@ -33,7 +33,7 @@ class FightView(discord.ui.View):
             await self.end_fight(interaction, True)
             return
 
-        # 3. Odwet potwora: jego atak - (Twoja obrona + bonus z pancerza)
+        # Odwet potwora: jego atak - (Twoja obrona + bonus z pancerza)
         # max(0, ...) sprawia, że obrażenia nie mogą być ujemne (leczenie)
         m_dmg = max(0, self.monster['attack'] - (self.user['defense'] + def_bonus))
         self.user_hp -= m_dmg
@@ -44,7 +44,7 @@ class FightView(discord.ui.View):
             await self.end_fight(interaction, False)
             return
 
-        # 4. Aktualizacja embeda walki
+        # Aktualizacja embeda walki
         await self.update_message(interaction, log_msg)
 
     async def update_message(self, interaction, log_msg):

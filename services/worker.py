@@ -14,12 +14,12 @@ logging.basicConfig(
 def process_fight_log(ch, method, properties, body):
     data = json.loads(body)
     
-    # 1. Logowanie natychmiastowe do pliku (bezpieczeństwo danych)
+    # Logowanie natychmiastowe do pliku (bezpieczeństwo danych)
     log_entry = f"PLAYER_ID: {data['user_id']} | ACTION: {data['action']} | TARGET: {data['monster_name']}"
     logging.info(log_entry)
     print(f" [log] Zapisano zdarzenie dla gracza {data['user_id']}")
 
-    # 2. Tutaj mógłbyś dodać logikę: "jeśli uzbierasz 10 logów, zrób update w DB"
+    # Możliwość dodania logiki: "update w DB po uzbieraniu większej liczby logów"
     
     ch.basic_ack(delivery_tag=method.delivery_tag)
 
