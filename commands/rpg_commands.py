@@ -2,11 +2,129 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import random
+import time
+import asyncio
 
-from database.db import get_user, create_user, get_leaderboard, buy_item, get_user_inventory, update_user, use_item, get_all_items, get_item_by_id, toggle_equip_item
+from database.db import get_user, create_user, get_leaderboard, buy_item, get_user_inventory, update_user, use_item, get_all_items, get_item_by_id, toggle_equip_item, get_random_quests, regenerate_stamina
 from views.fight_view import FightView
 from services.monster_service import get_random_monster
 from services.rabbitmq import send_to_queue
+
+class QuestProgressView(discord.ui.View):
+    def __init__(self, quest, start_time, duration_sec, user_data, bot):
+        super().__init__(timeout=None)  # Manual timeout management, handles quest duration
+        self.quest = quest
+        self.start_time = start_time
+        self.duration_sec = duration_sec
+        self.user_data = user_data
+        self.bot = bot
+        self.update_progress()
+
+    def update_progress(self):
+        elapsed = time.time() - self.start_time
+        remaining = self.duration_sec - elapsed
+        
+        if remaining <= 0:
+            self.clear_items()
+            self.add_item(discord.ui.Button(label="✅ Misja zakończona!", style=discord.ButtonStyle.success, disabled=True))
+            self.add_item(discord.ui.Button(label=f"💰 +{self.quest['gold']} złota", disabled=True))
+            self.add_item(discord.ui.Button(label=f"✨ +{self.quest['exp']} EXP", disabled=True))
+        else:
+            progress = int((elapsed / self.duration_sec) * 10)
+            bar = "█" * progress + "░" * (10 - progress)
+            min_left = int(remaining // 60)
+            sec_left = int(remaining % 60)
+            percent = int((elapsed / self.duration_sec) * 100)
+            
+            self.clear_items()
+            self.add_item(discord.ui.Button(label=f"⚔️ {self.quest['name']}", disabled=True))
+            self.add_item(discord.ui.Button(label=f"⏱️ {min_left}:{sec_left:02d} pozostało", disabled=True))
+            self.add_item(discord.ui.Button(label=f"📊 [{bar}] {percent}%", disabled=True))
+            self.add_item(discord.ui.Button(label=f"💰 {self.quest['gold']} złota", disabled=True))
+            self.add_item(discord.ui.Button(label=f"✨ {self.quest['exp']} EXP", disabled=True))
+
+class QuestView(discord.ui.View):
+    def __init__(self, user_data, quests, bot):
+        super().__init__(timeout=60)
+        self.user_data = user_data
+        self.quests = quests
+        self.bot = bot
+
+    async def start_quest(self, interaction: discord.Interaction, quest_idx: int):
+        quest = self.quests[quest_idx]
+        
+        # Publish quest selection to RabbitMQ for worker processing
+        quest_data = {
+            "user_id": self.user_data['discord_id'],
+            "monster_name": quest['name'],
+            "duration_minutes": quest['duration'],
+            "gold_reward": quest['gold'],
+            "exp_reward": quest['exp'],
+            "action": "start_quest"
+        }
+        send_to_queue('quest_selections', quest_data)
+        
+        # Disable quest selection buttons after choice
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
+        
+        # Initialize quest progress display
+        start_time = time.time()
+        duration_sec = quest['duration'] * 60
+        progress_view = QuestProgressView(quest, start_time, duration_sec, self.user_data, self.bot)
+        
+        await interaction.message.edit(content=f"⚔️ Wyruszyłeś na misję: **{quest['name']}**!", view=progress_view)
+        followup = interaction.message
+        
+        # Schedule background task for quest timer
+        self.bot.loop.create_task(self.update_quest_progress(followup, quest, start_time, duration_sec))
+
+    async def update_quest_progress(self, followup, quest, start_time, duration_sec):
+        while True:
+            elapsed = time.time() - start_time
+            remaining = duration_sec - elapsed
+            
+            if remaining <= 0:
+                fight_view = FightView(self.user_data, quest['monster'], on_win=self.return_to_tavern, on_lose=self.return_to_tavern)
+                await followup.edit(content="⚔️ Natrafiłeś na potwora! Czas na walkę!", view=fight_view)
+                break
+            
+            progress_view = QuestProgressView(quest, start_time, duration_sec, self.user_data, self.bot)
+            await followup.edit(view=progress_view)
+            await asyncio.sleep(5)  # Update UI every 5 seconds
+
+    async def return_to_tavern(self, interaction):
+        # Regenerate stamina based on time elapsed
+        await regenerate_stamina(self.user_data['discord_id'])
+        
+        # Fetch new random quest pool
+        quests = await get_random_quests(self.user_data['discord_id'])
+        
+        # Render tavern UI with new quests
+        quest_view = QuestView(self.user_data, quests, self.bot)
+        
+        embed = discord.Embed(title="🍻 Karczma u Podpitego Goblina", color=0x6b4226)
+        for i, q in enumerate(quests, 1):
+            embed.add_field(
+                name=f"📜 Misja {i}: {q['name']}",
+                value=f"⏱️ **Czas:** {q['duration']} min\n💰 **Złoto:** {q['gold']}\n✨ **EXP:** {q['exp']}",
+                inline=False
+            )
+        
+        await interaction.response.edit_message(embed=embed, view=quest_view)
+
+    @discord.ui.button(label="Misja 1", style=discord.ButtonStyle.primary)
+    async def quest_1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.start_quest(interaction, 0)
+
+    @discord.ui.button(label="Misja 2", style=discord.ButtonStyle.success)
+    async def quest_2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.start_quest(interaction, 1)
+
+    @discord.ui.button(label="Misja 3", style=discord.ButtonStyle.danger)
+    async def quest_3(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.start_quest(interaction, 2)
 
 class RPGCog(commands.Cog):
     def __init__(self, bot):
@@ -45,34 +163,37 @@ class RPGCog(commands.Cog):
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="fight", description="Walcz z potworem z D&D API")
-    async def fight(self, interaction: discord.Interaction):
-        user = await get_user(str(interaction.user.id))
-        if not user or user['stamina'] < 10:
-            await interaction.response.send_message("Brak sił (stamina < 10)!", ephemeral=True)
+    @app_commands.command(name="tavern", description="Odwiedź karczmę i wybierz misję")
+    async def tavern(self, interaction: discord.Interaction):
+        user_id = str(interaction.user.id)
+        user = await get_user(user_id)
+        
+        if not user:
+            await interaction.response.send_message("Najpierw użyj /start!", ephemeral=True)
             return
 
-        await interaction.response.defer()
-        monster = await get_random_monster()
-        if not monster:
-            monster = {"name": "Zły Cień", "hp": 30, "attack": 5, "gold": 10, "image": None}
+        # Regenerujemy staminę
+        await regenerate_stamina(user_id)
+        user = await get_user(user_id)  # Odśwież dane po regeneracji
 
-        # --- RABBITMQ LOGIC ---
-        # Wysyłanie info o walce do kolejki
-        fight_log = {
-            "user_id": user['discord_id'],
-            "monster_name": monster['name'],
-            "action": "start_fight"
-        }
-        send_to_queue('fight_logs', fight_log)
-        # ----------------------
+        if user['stamina'] < 10:
+            await interaction.response.send_message("⚡ Za mało staminy! Odpocznij chwilę.", ephemeral=True)
+            return
 
-        view = FightView(user, monster)
-        embed = discord.Embed(title=f"⚔️ Napotykasz: {monster['name']}", color=0xe74c3c)
-        embed.add_field(name="👾 Potwór", value=f"❤️ HP: {monster['hp']} | ⚔️ Atak: {monster['attack']}")
-        if monster['image']: embed.set_thumbnail(url=monster['image'])
+        # Generujemy 3 misje
+        quests = await get_random_quests(user_id)
         
-        await interaction.followup.send(embed=embed, view=view)
+        embed = discord.Embed(title="🍻 Karczma u Podpitego Goblina", color=0x6b4226)
+        for i, q in enumerate(quests, 1):
+            embed.add_field(
+                name=f"📜 Misja {i}: {q['name']}",
+                value=f"⏱️ **Czas:** {q['duration']} min\n💰 **Złoto:** {q['gold']}\n✨ **EXP:** {q['exp']}",
+                inline=False
+            )
+        embed.set_footer(text=f"⚡ Stamina: {user['stamina']}/100")
+        
+        view = QuestView(user, quests, self.bot)
+        await interaction.response.send_message(embed=embed, view=view)
 
     @app_commands.command(name="shop", description="Otwiera sklep")
     async def shop(self, interaction: discord.Interaction):
@@ -134,6 +255,26 @@ class RPGCog(commands.Cog):
             await interaction.response.send_message("❤️ HP odnowione!")
         else:
             await interaction.response.send_message("❌ Nie masz mikstur!", ephemeral=True)
+
+    @app_commands.command(name="expedition_status", description="Sprawdź status swojej misji")
+    async def expedition_status(self, interaction: discord.Interaction):
+        user_id = str(interaction.user.id)
+        user = await get_user(user_id)
+        if not user:
+            await interaction.response.send_message("Najpierw użyj /start!", ephemeral=True)
+            return
+
+        if user['on_expedition']:
+            elapsed = time.time() - user['expedition_start_time']
+            remaining = user['expedition_duration'] * 60 - elapsed
+            if remaining > 0:
+                min_left = int(remaining // 60)
+                sec_left = int(remaining % 60)
+                await interaction.response.send_message(f"⚔️ Jesteś na misji! Pozostało: {min_left} min {sec_left} sek")
+            else:
+                await interaction.response.send_message("Misja powinna już się zakończyć! Spróbuj ponownie za chwilę.")
+        else:
+            await interaction.response.send_message("Nie jesteś obecnie na misji.")
 
 async def setup(bot):
     await bot.add_cog(RPGCog(bot))

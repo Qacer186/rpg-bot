@@ -1,26 +1,28 @@
 import discord
 import random
-from database.db import update_user_after_fight, get_equipped_bonuses
+from database.db import update_user_after_fight, get_equipped_bonuses, get_user
 
 class FightView(discord.ui.View):
-    def __init__(self, user_data, monster):
+    def __init__(self, user_data, monster, on_win=None, on_lose=None):
         super().__init__(timeout=60)
         self.user = user_data
         self.monster = monster
-        # Kopiujemy dane do walki, żeby nie zmieniać bazy przy każdym kliknięciu
+        self.on_win = on_win
+        self.on_lose = on_lose
+        # Local HP copy for fight simulation (DB updated only on end_fight)
         self.user_hp = user_data['hp']
         self.monster_hp = monster['hp']
 
     @discord.ui.button(label="⚔️ Atakuj", style=discord.ButtonStyle.danger)
     async def attack(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Pobieranie bonusów z założonego ekwipunku (centralna logika w database/db.py)
+        # Fetch equipment bonuses from database
         bonuses = await get_equipped_bonuses(self.user['discord_id'])
 
-        # Obsługa przypadku, gdy SUM zwraca None (brak przedmiotów)
+        # Handle NULL from aggregate query when no equipped items
         atk_bonus = bonuses['total_atk'] if bonuses and bonuses['total_atk'] else 0
         def_bonus = bonuses['total_def'] if bonuses and bonuses['total_def'] else 0
 
-        # Atak gracza: baza + bonus z broni +/- losowość
+        # Player attack: base stat + equipment bonus +/- variance
         dmg = random.randint(
             self.user['attack'] + atk_bonus - 2, 
             self.user['attack'] + atk_bonus + 5
@@ -28,23 +30,23 @@ class FightView(discord.ui.View):
         self.monster_hp -= dmg
         log_msg = f"Zadałeś **{dmg}** obrażeń potworowi {self.monster['name']}!"
 
-        # Sprawdzenie, czy potwór padł
+        # Check if monster HP <= 0
         if self.monster_hp <= 0:
             await self.end_fight(interaction, True)
             return
 
-        # Odwet potwora: jego atak - (Twoja obrona + bonus z pancerza)
-        # max(0, ...) sprawia, że obrażenia nie mogą być ujemne (leczenie)
+        # Monster counter-attack: monster_attack - (player_defense + equipment_bonus)
+        # Clamp to 0 minimum (no healing from defense)
         m_dmg = max(0, self.monster['attack'] - (self.user['defense'] + def_bonus))
         self.user_hp -= m_dmg
         log_msg += f"\nPotwór oddaje za **{m_dmg}**!"
 
-        # Sprawdzenie, czy gracz padł
+        # Check if player HP <= 0
         if self.user_hp <= 0:
             await self.end_fight(interaction, False)
             return
 
-        # Aktualizacja embeda walki
+        # Update fight UI
         await self.update_message(interaction, log_msg)
 
     async def update_message(self, interaction, log_msg):
@@ -55,14 +57,24 @@ class FightView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
     async def end_fight(self, interaction, win):
+        # Fetch current user state from DB to ensure no stale exp values
+        current_user = await get_user(self.user['discord_id'])
+        
         if win:
             gold = self.monster['gold']
             exp = 20
-            await update_user_after_fight(self.user['discord_id'], self.user_hp, self.user['exp'] + exp, gold, self.user['stamina'] - 10)
+            await update_user_after_fight(self.user['discord_id'], self.user_hp, current_user['exp'] + exp, gold, current_user['stamina'] - 10)
             msg = f"🏆 Wygrana! Zdobywasz {gold} złota i {exp} EXP."
+            if self.on_win:
+                await self.on_win(interaction)
+                return
         else:
-            await update_user_after_fight(self.user['discord_id'], 20, self.user['exp'], 0, self.user['stamina'] - 10)
+            # Loss: no EXP gain, use current DB value unchanged to prevent stale exp inflation
+            await update_user_after_fight(self.user['discord_id'], 20, current_user['exp'], 0, current_user['stamina'] - 10)
             msg = "💀 Przegrałeś! Twoje HP spadło do 20."
+            if self.on_lose:
+                await self.on_lose(interaction)
+                return
 
         embed = discord.Embed(title="Koniec walki", description=msg, color=0x2ecc71 if win else 0x000000)
         await interaction.response.edit_message(embed=embed, view=None)

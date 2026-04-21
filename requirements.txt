@@ -2,3 +2,5 @@ discord.py
 aiosqlite
 python-dotenv
 pika
+aiohttp
+aio-pika

@@ -1,4 +1,7 @@
 import aiosqlite
+import aiohttp
+import random
+import time
 
 DB_NAME = "rpg.db"
 
@@ -16,7 +19,10 @@ async def init_db():
             attack INTEGER DEFAULT 10,
             defense INTEGER DEFAULT 5,
             gold INTEGER DEFAULT 50, -- Dajemy 50 na start na pierwszy miecz
-            stamina INTEGER DEFAULT 100
+            stamina INTEGER DEFAULT 100,
+            on_expedition INTEGER DEFAULT 0,
+            expedition_start_time REAL DEFAULT 0,
+            expedition_duration INTEGER DEFAULT 0
         )
         """)
 
@@ -42,11 +48,27 @@ async def init_db():
         )
         """)
 
-        # Dodawanie przykładowych przedmiotów, jeśli ich nie ma
-        await db.execute("INSERT OR IGNORE INTO items (id, name, price, atk_bonus, def_bonus) VALUES (1, 'Drewniany Miecz', 30, 3, 0)")
-        await db.execute("INSERT OR IGNORE INTO items (id, name, price, atk_bonus, def_bonus) VALUES (2, 'Skórzana Tunika', 30, 0, 2)")
-        await db.execute("INSERT OR IGNORE INTO items (id, name, price, atk_bonus, def_bonus) VALUES (3, 'Żelazny Miecz', 120, 10, 0)")
-        await db.execute("INSERT OR IGNORE INTO items (id, name, price, atk_bonus, def_bonus) VALUES (4, 'Mikstura HP', 20, 0, 0)")
+        # Dodawanie nowych kolumn, jeśli nie istnieją
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN on_expedition INTEGER DEFAULT 0")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN expedition_start_time REAL DEFAULT 0")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN expedition_duration INTEGER DEFAULT 0")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN max_stamina INTEGER DEFAULT 100")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN last_regen REAL DEFAULT 0")
+        except:
+            pass
         
         await db.commit()
 
@@ -87,9 +109,9 @@ async def get_leaderboard(limit: int = 10):
 async def create_user(discord_id: str):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
-        INSERT OR IGNORE INTO users (discord_id)
-        VALUES (?)
-        """, (discord_id,))
+        INSERT OR IGNORE INTO users (discord_id, last_regen)
+        VALUES (?, ?)
+        """, (discord_id, time.time()))
         await db.commit()
 
 async def get_user(discord_id: str):
@@ -157,6 +179,20 @@ async def update_user(discord_id: str, **kwargs):
         await db.execute(f"UPDATE users SET {set_clause} WHERE discord_id = ?", values)
         await db.commit()
 
+async def regenerate_stamina(discord_id: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        user = await get_user(discord_id)
+        if not user:
+            return
+        now = time.time()
+        regen_rate = 60  # 1 punkt staminy na minutę
+        time_passed = now - user['last_regen']
+        points_to_add = int(time_passed // regen_rate)
+        if points_to_add > 0:
+            new_stamina = min(user['stamina'] + points_to_add, user['max_stamina'])
+            await db.execute("UPDATE users SET stamina = ?, last_regen = ? WHERE discord_id = ?", (new_stamina, now, discord_id))
+            await db.commit()
+
 # Funkcja do użycia przedmiotu konsumpcyjnego (usuwa jeden z inventory)
 async def use_item(discord_id: str, item_name: str):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -176,3 +212,44 @@ async def use_item(discord_id: str, item_name: str):
         await db.execute("DELETE FROM inventory WHERE id = ?", (inv_item['id'],))
         await db.commit()
         return True
+
+API_MONSTERS_URL = "https://www.dnd5eapi.co/api/monsters"
+
+async def get_random_quests(user_id: str):
+    """Losuje 3 potwory z API i przypisuje im nagrody skalowane poziomem gracza"""
+    user = await get_user(user_id)
+    level = user['level'] if user else 1
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.get(API_MONSTERS_URL) as response:
+            if response.status != 200: return []
+            all_data = await response.json()
+            # Losujemy 3 różne indeksy z listy potworów
+            random_indices = random.sample(range(len(all_data['results'])), 3)
+            
+            quests = []
+            for idx in random_indices:
+                monster_ref = all_data['results'][idx]
+                async with session.get(f"https://www.dnd5eapi.co{monster_ref['url']}") as res:
+                    details = await res.json()
+                    
+                    # Logika nagród w stylu S&F: złoto vs doświadczenie
+                    # Misje o różnej trudności i czasie trwania
+                    duration = random.choice([1, 2]) # minuty
+                    base_gold = random.randint(10, 50) * level
+                    base_exp = random.randint(50, 150) * level
+                    
+                    quests.append({
+                        "name": details.get("name", "Tajemniczy Przeciwnik"),
+                        "duration": duration,
+                        "gold": base_gold if random.random() > 0.5 else int(base_gold * 0.5),
+                        "exp": base_exp if random.random() < 0.5 else int(base_exp * 2),
+                        "cr": details.get("challenge_rating", 1),
+                        "monster": {
+                            "name": details.get("name", "Nieznany Potwór"),
+                            "hp": details.get("hit_points", 50),
+                            "attack": details.get("strength", 10),
+                            "gold": random.randint(10, 30)
+                        }
+                    })
+            return quests
