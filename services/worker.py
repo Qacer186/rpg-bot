@@ -67,13 +67,13 @@ async def main():
         channel = await connection.channel()
         
         # Kolejka dla fight_logs
-        await channel.declare_queue('fight_logs')
+        await channel.declare_queue('fight_logs', durable=True)
         await channel.set_qos(prefetch_count=1)
         fight_queue = await channel.get_queue('fight_logs')
         await fight_queue.consume(process_fight_log)
         
         # Kolejka dla quest_selections
-        await channel.declare_queue('quest_selections')
+        await channel.declare_queue('quest_selections', durable=True)
         quest_queue = await channel.get_queue('quest_selections')
         await quest_queue.consume(process_quest_selection)
         

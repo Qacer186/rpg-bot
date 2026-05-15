@@ -5,12 +5,14 @@ from database.db import update_user_after_fight, get_equipped_bonuses, get_user
 
 
 class FightView(discord.ui.View):
-    def __init__(self, user_data, monster, on_win=None, on_lose=None):
+    def __init__(self, user_data, monster, on_win=None, on_lose=None, gold_reward=0, exp_reward=0):
         super().__init__(timeout=None)  # Manual timeout - fights can be long
         self.user = user_data
         self.monster = monster
         self.on_win = on_win
         self.on_lose = on_lose
+        self.gold_reward = gold_reward  # Quest reward (not monster drop)
+        self.exp_reward = exp_reward    # Quest reward (not monster drop)
         # Local HP copy for fight simulation (DB updated only on end_fight)
         self.user_hp = user_data['hp']
         self.monster_hp = monster['hp']
@@ -68,20 +70,35 @@ class FightView(discord.ui.View):
 
     async def update_message(self, interaction, log_msg):
         """Update fight display with current HP and combat log"""
-        embed = discord.Embed(title=f"⚔️ Walka z {self.monster['name']}", color=0xe74c3c)
+        embed = discord.Embed(
+            title=f"⚔️ Walka z {self.monster['name']}",
+            description=log_msg,
+            color=0xe74c3c
+        )
         
-        # Player HP bar
+        # Player HP bar with percentage
         player_hp_percent = int((self.user_hp / self.user['max_hp']) * 10)
         player_bar = "❤️" * player_hp_percent + "🖤" * (10 - player_hp_percent)
         
-        # Monster HP bar
+        # Monster HP bar with percentage
         monster_hp_percent = int((self.monster_hp / self.monster['hp']) * 10)
         monster_bar = "❤️" * monster_hp_percent + "🖤" * (10 - monster_hp_percent)
         
-        embed.add_field(name="👤 Ty", value=f"HP: {self.user_hp}/{self.user['max_hp']}\n{player_bar}", inline=False)
-        embed.add_field(name=f"👹 {self.monster['name']}", value=f"HP: {self.monster_hp}/{self.monster['hp']}\n{monster_bar}", inline=False)
-        embed.set_footer(text=log_msg)
+        # Player stats
+        embed.add_field(
+            name=f"👤 {interaction.user.name}",
+            value=f"HP: `{self.user_hp}/{self.user['max_hp']}`\n{player_bar}",
+            inline=False
+        )
         
+        # Monster stats
+        embed.add_field(
+            name=f"👹 {self.monster['name']}",
+            value=f"HP: `{self.monster_hp}/{self.monster['hp']}`\n{monster_bar}",
+            inline=False
+        )
+        
+        embed.set_footer(text="Kliknij 'Atakuj' aby kontynuować")
         await interaction.followup.edit_message(interaction.message.id, embed=embed, view=self)
 
     async def end_fight(self, interaction, win):
@@ -90,22 +107,29 @@ class FightView(discord.ui.View):
         current_user = await get_user(self.user['discord_id'])
         
         if win:
-            # Victory: grant 20 EXP + gold reward, reduce stamina by 10
-            gold = self.monster['gold']
-            exp = 20
-            await update_user_after_fight(self.user['discord_id'], self.user_hp, current_user['exp'] + exp, gold, current_user['stamina'] - 10)
-            
+            # Victory: grant quest reward EXP + gold, restore HP to max, reduce stamina by 10
+            gold = self.gold_reward
+            exp = self.exp_reward
+            await update_user_after_fight(
+                self.user['discord_id'],
+                current_user['max_hp'],
+                current_user['exp'] + exp,
+                gold,
+                max(0, current_user['stamina'] - 10)
+            )
+
             embed = discord.Embed(
                 title="🏆 WYGRANA!",
-                description=f"Pokonałeś {self.monster['name']}!",
+                description=f"Pokonałeś **{self.monster['name']}**!",
                 color=0x2ecc71
             )
+            embed.add_field(name="❤️ HP przywrócone do", value=f"{current_user['max_hp']}/{current_user['max_hp']}", inline=True)
             embed.add_field(name="💰 Złoto", value=f"+{gold}", inline=True)
             embed.add_field(name="✨ Doświadczenie", value=f"+{exp} EXP", inline=True)
-            embed.add_field(name="❤️ Twoje HP", value=f"{self.user_hp}/{self.user['max_hp']}", inline=True)
-            
+            embed.set_footer(text="Powróciłeś do karczmy...")
+
             await interaction.followup.edit_message(interaction.message.id, embed=embed, view=None)
-            
+
             if self.on_win:
                 await self.on_win(interaction)
                 return
@@ -116,12 +140,13 @@ class FightView(discord.ui.View):
             
             embed = discord.Embed(
                 title="💀 PRZEGRANA",
-                description=f"{self.monster['name']} Cię pokonał...",
+                description=f"**{self.monster['name']}** Cię pokonał...",
                 color=0xe74c3c
             )
-            embed.add_field(name="❤️ Pozostało HP", value="20", inline=True)
+            embed.add_field(name="❤️ HP przywrócone do", value="20", inline=True)
             embed.add_field(name="💰 Strata", value="0 złota", inline=True)
-            embed.add_field(name="✨ Strata", value="0 EXP", inline=True)
+            embed.add_field(name="✨ Brak EXP", value="0 EXP", inline=True)
+            embed.set_footer(text="Obudź się w tawernie...")
             
             await interaction.followup.edit_message(interaction.message.id, embed=embed, view=None)
             

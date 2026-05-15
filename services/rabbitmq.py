@@ -4,7 +4,7 @@ import json
 def send_to_queue(queue_name, data):
     connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
     channel = connection.channel()
-    channel.queue_declare(queue=queue_name)
+    channel.queue_declare(queue=queue_name, durable=True)
     
     channel.basic_publish(exchange='',
                           routing_key=queue_name,
