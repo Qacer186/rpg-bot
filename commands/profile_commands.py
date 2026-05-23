@@ -1,7 +1,8 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-from database.db import get_user, get_equipped_bonuses, get_leaderboard
+from database.db import get_user, get_equipped_bonuses, get_leaderboard, regenerate_stamina, exp_info_line
+from utils.containers import message_view
 
 
 class ProfileCog(commands.Cog):
@@ -10,64 +11,66 @@ class ProfileCog(commands.Cog):
 
     @staticmethod
     def create_progress_bar(current, maximum, length=10):
+        if maximum <= 0:
+            return "⬜" * length
         filled = int(length * current / maximum)
+        filled = max(0, min(length, filled))
         return "🟩" * filled + "⬜" * (length - filled)
 
     @app_commands.command(name="profile", description="Pokazuje profil gracza")
     async def profile(self, interaction: discord.Interaction):
-        user = await get_user(str(interaction.user.id))
+        user_id = str(interaction.user.id)
+        await regenerate_stamina(user_id)
+        user = await get_user(user_id)
         if not user:
-            await interaction.response.send_message("Użyj /start!", ephemeral=True)
+            await interaction.response.send_message(view=message_view("❌ Użyj `/start`!", 0xE74C3C), ephemeral=True)
             return
 
-        bonuses = await get_equipped_bonuses(str(interaction.user.id))
+        bonuses = await get_equipped_bonuses(user_id)
         atk_bonus = bonuses['total_atk'] if bonuses and bonuses['total_atk'] else 0
         def_bonus = bonuses['total_def'] if bonuses and bonuses['total_def'] else 0
 
         hp_bar = self.create_progress_bar(user['hp'], user['max_hp'], 15)
-        stamina_bar = self.create_progress_bar(user['stamina'], 100, 15)
+        stamina_bar = self.create_progress_bar(user['stamina'], user['max_stamina'], 15)
 
-        embed = discord.Embed(
-            title=f"👤 PROFIL: {interaction.user.name}",
-            description="═══════════════════════════════════════",
-            color=0x3498db
+        text = (
+            f"### 👤 PROFIL: {interaction.user.name}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "**🎯 Podstawowe**\n"
+            f"Lvl: `{user['level']}`\n"
+            f"EXP: `{user['exp']}`\n"
+            f"{exp_info_line(user)}\n\n"
+            "**⚔️ Walka**\n"
+            f"Atak: `{user['attack']} (+{atk_bonus} ekwip.)`\n"
+            f"Obrona: `{user['defense']} (+{def_bonus} ekwip.)`\n"
+            f"Razem atak: `{user['attack'] + atk_bonus}`\n"
+            f"Razem obrona: `{user['defense'] + def_bonus}`\n\n"
+            "**❤️ Zdrowie**\n"
+            f"{hp_bar}\n"
+            f"`{user['hp']}/{user['max_hp']} HP`\n"
+            "HP odnawia się o `1` punkt co `2 min`.\n\n"
+            "**⚡ Stamina**\n"
+            f"{stamina_bar}\n"
+            f"`{user['stamina']}/{user['max_stamina']}`\n\n"
+            "**💰 Zasoby**\n"
+            f"Złoto: `{user['gold']}`\n"
+            f"Grzybki: `{user['mushrooms']}`\n\n"
+            "Spróbuj `/tavern`, aby kontynuować przygodę."
         )
-        embed.add_field(
-            name="🎯 PODSTAWOWE",
-            value=f"**Lvl:** {user['level']}\n"
-                  f"**EXP:** {user['exp']}",
-            inline=False
-        )
-        embed.add_field(
-            name="⚔️ WALKA",
-            value=f"**Atak:** {user['attack']} (+{atk_bonus} ekwip.)\n"
-                  f"**Obrona:** {user['defense']} (+{def_bonus} ekwip.)\n"
-                  f"**Razem Atak:** {user['attack'] + atk_bonus}\n"
-                  f"**Razem Obrona:** {user['defense'] + def_bonus}",
-            inline=False
-        )
-        embed.add_field(name="❤️ ZDROWIE", value=f"{hp_bar}\n`{user['hp']}/{user['max_hp']} HP`", inline=False)
-        embed.add_field(name="⚡ STAMINA", value=f"{stamina_bar}\n`{user['stamina']}/100`", inline=False)
-        embed.add_field(name="💰 ZASOBY", value=f"**Złota:** {user['gold']}\n**Doświadczenie:** {user['exp']}", inline=False)
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        embed.set_footer(text="Spróbuj /tavern aby kontynuować przygodę!")
-
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(view=message_view(text, 0x3498DB))
 
     @app_commands.command(name="leaderboard", description="Top 10 graczy")
     async def leaderboard(self, interaction: discord.Interaction):
         users = await get_leaderboard(10)
-        embed = discord.Embed(title="🏆 Ranking", color=0xffd700)
         if not users:
-            embed.description = "Brak graczy"
+            text = "### 🏆 Ranking\nBrak graczy."
         else:
+            rows = ["### 🏆 Ranking"]
             for i, user in enumerate(users, 1):
-                embed.add_field(
-                    name=f"{i}. {user['discord_id']}",
-                    value=f"Lvl {user['level']} | EXP: {user['exp']} | Gold: {user['gold']}",
-                    inline=False
-                )
-        await interaction.response.send_message(embed=embed)
+                rows.append(f"**{i}.** `{user['discord_id']}` | Lvl `{user['level']}` | EXP `{user['exp']}` | Gold `{user['gold']}` | 🍄 `{user['mushrooms']}`")
+            text = "\n".join(rows)
+
+        await interaction.response.send_message(view=message_view(text, 0xF1C40F))
 
 
 async def setup(bot):

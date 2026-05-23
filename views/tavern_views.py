@@ -1,17 +1,112 @@
+import asyncio
+import math
+import time
+
 import discord
 from discord import ui
-import time
-from database.db import update_user_after_fight, get_user, get_random_quests, regenerate_stamina
-from views.fight_view import FightView
+
+from database.db import (
+    get_random_quests,
+    get_user,
+    exp_info_line,
+    regenerate_stamina,
+    update_user,
+    update_user_after_fight,
+)
 from services.rabbitmq import send_to_queue
+from utils.containers import add_action_row, add_container, message_view
+from utils.security import ensure_view_owner
+from views.fight_view import FightView
 
 
 def create_progress_bar(current, maximum, length=10):
+    if maximum <= 0:
+        return "⬜" * length
     filled = int(length * current / maximum)
+    filled = max(0, min(length, filled))
     return "🟩" * filled + "⬜" * (length - filled)
 
 
-class QuestProgressView(discord.ui.View):
+def format_quest_time(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    minutes, sec = divmod(seconds, 60)
+    if minutes > 0:
+        return f"{minutes} min {sec} sek"
+    return f"{sec} sek"
+
+
+def quest_progress_values(start_time: float, duration_sec: int):
+    if duration_sec <= 0:
+        return 0, 10, 100
+
+    elapsed = time.time() - start_time
+    elapsed = max(0, min(duration_sec, elapsed))
+    remaining = max(0, math.ceil(duration_sec - elapsed))
+    progress = int((elapsed / duration_sec) * 10)
+    progress = max(0, min(10, progress))
+    percent = int((elapsed / duration_sec) * 100)
+    percent = max(0, min(100, percent))
+
+    if remaining == 0:
+        progress = 10
+        percent = 100
+
+    return remaining, progress, percent
+
+
+def build_tavern_text(user, quests, footer=None):
+    hp_bar = create_progress_bar(user['hp'], user['max_hp'], 15)
+    stamina_bar = create_progress_bar(user['stamina'], user['max_stamina'], 15)
+
+    rows = [
+        "### 🍻 KARCZMA U PODPITEGO GOBLINA",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "**⚔️ Statystyki**",
+        f"Lvl: `{user['level']}` | EXP: `{user['exp']}`",
+        exp_info_line(user),
+        f"Atak: `{user['attack']}` | Obrona: `{user['defense']}`",
+        "",
+        "**❤️ Zdrowie**",
+        hp_bar,
+        f"`{user['hp']}/{user['max_hp']} HP`",
+        "HP odnawia się o 1 punkt co 2 min.",
+        "",
+        "**⚡ Stamina**",
+        stamina_bar,
+        f"`{user['stamina']}/{user['max_stamina']}`",
+        "",
+        "**💰 Portfel**",
+        f"`{user['gold']} złota`",
+        f"🍄 `{user['mushrooms']} grzybków`",
+        "",
+        "**📜 Dostępne misje**",
+        "Misje są ułożone od najtrudniejszej do najłatwiejszej.",
+        "Odświeżenie misji: `/refresh_missions` za 1 grzybka."
+    ]
+
+    if not quests:
+        rows.append("Nie udało się pobrać misji.")
+    else:
+        for i, quest in enumerate(quests, 1):
+            difficulty = quest.get('difficulty_label', '📜 MISJA')
+            fight_info = "⚔️ Walka: `tak`" if quest.get('requires_combat', True) else "✅ Walka: `nie, 100% wygranej`"
+
+            rows.append(
+                f"\n**Misja {i}: {quest['name']}**\n"
+                f"{difficulty}\n"
+                f"⏱️ Czas: `{quest['duration']} min`\n"
+                f"{fight_info}\n"
+                f"💰 Złoto: `{quest['gold']}`\n"
+                f"✨ EXP: `{quest['exp']}`"
+            )
+
+    if footer:
+        rows.append(f"\n{footer}")
+
+    return "\n".join(rows)
+
+
+class QuestProgressView(discord.ui.LayoutView):
     def __init__(self, quest, start_time, duration_sec, user_data, bot):
         super().__init__(timeout=None)
         self.quest = quest
@@ -20,81 +115,129 @@ class QuestProgressView(discord.ui.View):
         self.end_time = start_time + duration_sec
         self.user_data = user_data
         self.bot = bot
+        self.rebuild()
 
-    @ui.button(label="🛑 Anuluj misję", style=discord.ButtonStyle.danger)
-    async def cancel_quest(self, interaction: discord.Interaction, button: ui.Button):
+    def rebuild(self):
+        self.clear_items()
+        container = add_container(self, self.get_timestamp_text(), 0x6B4226)
+        cancel_btn = ui.Button(label="🛑 Anuluj misję", style=discord.ButtonStyle.danger)
+        cancel_btn.callback = self.cancel_quest
+        add_action_row(container, cancel_btn)
+
+    async def cancel_quest(self, interaction: discord.Interaction):
+        if not await ensure_view_owner(interaction, self.user_data['discord_id'], "/tavern"):
+            return
+
         await interaction.response.defer()
 
-        embed = discord.Embed(
-            title="❌ Misja anulowana",
-            description=f"Opuściłeś misję: **{self.quest['name']}**",
-            color=0xe74c3c
+        current_user = await get_user(self.user_data['discord_id'])
+        if not current_user or not current_user['on_expedition']:
+            await interaction.followup.send(view=message_view("⚠️ Ta misja jest już zakończona albo anulowana.", 0xE67E22), ephemeral=True)
+            return
+
+        if current_user:
+            await update_user_after_fight(
+                self.user_data['discord_id'],
+                current_user['hp'],
+                current_user['exp'],
+                0,
+                max(0, current_user['stamina'] - 5)
+            )
+            await update_user(
+                self.user_data['discord_id'],
+                on_expedition=0,
+                expedition_start_time=0,
+                expedition_duration=0
+            )
+
+        text = (
+            "### ❌ Misja anulowana\n"
+            f"Opuściłeś misję: **{self.quest['name']}**\n\n"
+            "💔 Kara: `-5 staminy`"
         )
-        embed.add_field(name="💔 Kara", value="Strata 5 staminy", inline=True)
+        await interaction.message.edit(view=message_view(text, 0xE74C3C))
 
-        await update_user_after_fight(
-            self.user_data['discord_id'],
-            self.user_data['hp'],
-            self.user_data['exp'],
-            0,
-            max(0, self.user_data['stamina'] - 5)
-        )
+    def get_timestamp_text(self):
+        remaining, progress, percent = quest_progress_values(self.start_time, self.duration_sec)
+        bar = "█" * progress + "░" * (10 - progress)
+        is_easy = not self.quest.get('requires_combat', True)
+        title = "### 📦 Misja czasowa w toku" if is_easy else "### ⚔️ Misja w toku"
+        fight_info = "✅ Bez walki, 100% wygranej" if is_easy else "⚔️ Po czasie rozpocznie się walka"
 
-        await interaction.message.edit(embed=embed, view=None)
-
-    def get_timestamp_embed(self):
-        elapsed = time.time() - self.start_time
-        remaining = self.duration_sec - elapsed
-
-        embed = discord.Embed(title="⚔️ Misja w toku", color=0x6b4226)
-        end_unix = int(self.end_time)
-        timestamp = f"<t:{end_unix}:R>"
-
-        embed.add_field(name="📍 Cel", value=f"**{self.quest['name']}**", inline=False)
-        embed.add_field(name="⏱️ Koniec", value=timestamp, inline=True)
-
-        if remaining > 0:
-            progress = int((elapsed / self.duration_sec) * 10)
-            bar = "█" * progress + "░" * (10 - progress)
-            percent = int((elapsed / self.duration_sec) * 100)
-            embed.add_field(name="📊 Postęp", value=f"`[{bar}]` {percent}%", inline=False)
+        if remaining == 0:
+            time_text = "⏱️ Pozostało: `0 sek`\n⌛ Misja dobiegła końca. Wynik pojawi się za chwilę."
         else:
-            embed.add_field(name="📊 Postęp", value="`[██████████]` 100%", inline=False)
+            time_text = f"⏱️ Pozostało: `{format_quest_time(remaining)}`"
 
-        embed.add_field(name="💰 Nagroda", value=f"{self.quest['gold']} złota", inline=True)
-        embed.add_field(name="✨ Doświadczenie", value=f"{self.quest['exp']} EXP", inline=True)
+        return (
+            f"{title}\n"
+            f"📍 Cel: **{self.quest['name']}**\n"
+            f"{self.quest.get('difficulty_label', '📜 MISJA')}\n"
+            f"{fight_info}\n"
+            f"{time_text}\n\n"
+            f"📊 Postęp: `[{bar}]` `{percent}%`\n\n"
+            f"💰 Nagroda: `{self.quest['gold']} złota`\n"
+            f"✨ Doświadczenie: `{self.quest['exp']} EXP`"
+        )
 
-        return embed
 
-
-class QuestView(discord.ui.View):
-    def __init__(self, user_data, quests, bot):
+class QuestView(discord.ui.LayoutView):
+    def __init__(self, user_data, quests, bot, footer=None):
         super().__init__(timeout=None)
         self.user_data = user_data
         self.quests = quests
         self.bot = bot
-        self.setup_quest_select()
+        self.footer = footer
+        self.locked = False
+        self.rebuild()
 
-    def setup_quest_select(self):
+    def rebuild(self):
         self.clear_items()
+        container = add_container(self, build_tavern_text(self.user_data, self.quests, self.footer), 0x6B4226)
+        self.setup_quest_select(container)
+
+    def setup_quest_select(self, container):
+        if not self.quests:
+            return
+
         select = ui.Select(
             placeholder="🎯 Wybierz misję...",
             min_values=1,
             max_values=1,
             options=[
                 discord.SelectOption(
-                    label=f"Misja {i + 1}: {quest['name']}",
-                    description=f"⏱️ {quest['duration']}m | 💰 {quest['gold']} | ✨ {quest['exp']}",
+                    label=f"Misja {i + 1}: {quest['name'][:80]}",
+                    description=(
+                        f"{quest.get('difficulty_label', '📜')} | "
+                        f"⏱️ {quest['duration']}m | 💰 {quest['gold']} | ✨ {quest['exp']}"
+                    )[:100],
                     value=str(i),
-                    emoji="⚔️"
+                    emoji="✅" if not quest.get('requires_combat', True) else "⚔️"
                 )
                 for i, quest in enumerate(self.quests)
             ]
         )
         select.callback = self.on_quest_select
-        self.add_item(select)
+        add_action_row(container, select)
 
     async def on_quest_select(self, interaction: discord.Interaction):
+        if not await ensure_view_owner(interaction, self.user_data['discord_id'], "/tavern"):
+            return
+
+        current_user = await get_user(self.user_data['discord_id'])
+        if not current_user:
+            await interaction.response.send_message(view=message_view("❌ Najpierw użyj `/start`!", 0xE74C3C), ephemeral=True)
+            return
+
+        if current_user['on_expedition']:
+            await interaction.response.send_message(view=message_view("⚠️ Masz już aktywną misję. Najpierw ją zakończ albo anuluj.", 0xE67E22), ephemeral=True)
+            return
+
+        if self.locked:
+            await interaction.response.send_message(view=message_view("⚠️ Ta wiadomość ma już wybraną misję. Użyj `/tavern`, żeby otworzyć nową karczmę.", 0xE67E22), ephemeral=True)
+            return
+
+        self.locked = True
         await interaction.response.defer()
 
         quest_idx = int(interaction.data['values'][0])
@@ -106,112 +249,154 @@ class QuestView(discord.ui.View):
             "duration_minutes": quest['duration'],
             "gold_reward": quest['gold'],
             "exp_reward": quest['exp'],
+            "difficulty": quest.get('difficulty', 'unknown'),
+            "requires_combat": quest.get('requires_combat', True),
             "action": "start_quest"
         }
-        send_to_queue('quest_selections', quest_data)
-
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(view=self)
 
         start_time = time.time()
+        await update_user(
+            self.user_data['discord_id'],
+            on_expedition=1,
+            expedition_start_time=start_time,
+            expedition_duration=quest['duration']
+        )
+
+        try:
+            send_to_queue('quest_selections', quest_data)
+        except Exception as e:
+            print(f"[RABBITMQ ERROR] {e}")
+
         duration_sec = quest['duration'] * 60
         progress_view = QuestProgressView(quest, start_time, duration_sec, self.user_data, self.bot)
-        progress_embed = progress_view.get_timestamp_embed()
-        await interaction.message.edit(embed=progress_embed, view=progress_view)
+        await interaction.message.edit(view=progress_view)
 
         self.bot.loop.create_task(self.update_quest_progress(interaction.message, quest, start_time, duration_sec))
 
     async def update_quest_progress(self, message, quest, start_time, duration_sec):
         try:
-            while True:
-                elapsed = time.time() - start_time
-                remaining = duration_sec - elapsed
+            end_time = start_time + duration_sec
+            last_rendered_second = None
 
-                if remaining <= 0:
+            while True:
+                current_user = await get_user(self.user_data['discord_id'])
+                if not current_user or not current_user['on_expedition']:
+                    break
+
+                remaining_float = end_time - time.time()
+                remaining_seconds = max(0, math.ceil(remaining_float))
+
+                should_render = (
+                    remaining_seconds != last_rendered_second
+                    and (remaining_seconds <= 30 or remaining_seconds % 5 == 0)
+                )
+
+                if should_render:
+                    progress_view = QuestProgressView(quest, start_time, duration_sec, self.user_data, self.bot)
+                    await message.edit(view=progress_view)
+                    last_rendered_second = remaining_seconds
+
+                if remaining_float <= 0:
+                    progress_view = QuestProgressView(quest, start_time, duration_sec, self.user_data, self.bot)
+                    await message.edit(view=progress_view)
+                    await asyncio.sleep(2)
+
+                    current_user = await get_user(self.user_data['discord_id'])
+                    if not current_user or not current_user['on_expedition']:
+                        break
+
+                    if not quest.get('requires_combat', True):
+                        await self.finish_easy_quest(message, quest)
+                        break
+
+                    await regenerate_stamina(self.user_data['discord_id'])
+                    fresh_user = await get_user(self.user_data['discord_id'])
                     fight_view = FightView(
-                        self.user_data,
+                        fresh_user,
                         quest['monster'],
                         on_win=self.return_to_tavern,
                         on_lose=self.return_to_tavern,
                         gold_reward=quest['gold'],
                         exp_reward=quest['exp']
                     )
-                    embed = discord.Embed(
-                        title="⚔️ Natrafiłeś na potwora!",
-                        description=f"Przed tobą stanął **{quest['monster']['name']}**!",
-                        color=0xe74c3c
-                    )
-                    embed.add_field(name="⚔️ Atak", value=str(quest['monster']['attack']), inline=True)
-                    embed.add_field(name="🛡️ Obrona", value=str(quest['monster']['defense']), inline=True)
-                    embed.add_field(name="❤️ HP", value=f"{quest['monster']['hp']} HP", inline=True)
-                    await message.edit(embed=embed, view=fight_view)
+                    await message.edit(view=fight_view)
                     break
 
-                if int(elapsed) % 10 < 2 or remaining < 30:
-                    progress_view = QuestProgressView(quest, start_time, duration_sec, self.user_data, self.bot)
-                    progress_embed = progress_view.get_timestamp_embed()
-                    await message.edit(embed=progress_embed, view=progress_view)
-
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
         except Exception as e:
             print(f"[QUEST ERROR] {e}")
             try:
+                current_user = await get_user(self.user_data['discord_id'])
+                if not current_user or not current_user['on_expedition']:
+                    return
+
+                if not quest.get('requires_combat', True):
+                    await self.finish_easy_quest(message, quest)
+                    return
+
+                await regenerate_stamina(self.user_data['discord_id'])
+                fresh_user = await get_user(self.user_data['discord_id'])
                 fight_view = FightView(
-                    self.user_data,
+                    fresh_user,
                     quest['monster'],
                     on_win=self.return_to_tavern,
                     on_lose=self.return_to_tavern,
                     gold_reward=quest['gold'],
                     exp_reward=quest['exp']
                 )
-                embed = discord.Embed(
-                    title="⚔️ Natrafiłeś na potwora!",
-                    description=f"Przed tobą stanął **{quest['monster']['name']}**!",
-                    color=0xe74c3c
-                )
-                await message.edit(embed=embed, view=fight_view)
+                await message.edit(view=fight_view)
             except Exception:
                 pass
 
+    async def finish_easy_quest(self, message, quest):
+        current_user = await get_user(self.user_data['discord_id'])
+        if not current_user:
+            return
+
+        await update_user_after_fight(
+            self.user_data['discord_id'],
+            current_user['hp'],
+            current_user['exp'] + quest['exp'],
+            quest['gold'],
+            max(0, current_user['stamina'] - 5)
+        )
+        await update_user(
+            self.user_data['discord_id'],
+            on_expedition=0,
+            expedition_start_time=0,
+            expedition_duration=0
+        )
+
+        fresh_user = await get_user(self.user_data['discord_id'])
+        await regenerate_stamina(fresh_user['discord_id'])
+        fresh_user = await get_user(fresh_user['discord_id'])
+        quests = await get_random_quests(fresh_user['discord_id'])
+
+        footer = (
+            "### ✅ Misja łatwa zakończona sukcesem\n"
+            f"Wykonano zadanie: **{quest['name']}**\n\n"
+            "Nie było walki z potworem, dlatego misja zakończyła się pewną wygraną.\n\n"
+            f"💰 Złoto: `+{quest['gold']}`\n"
+            f"✨ Doświadczenie: `+{quest['exp']} EXP`\n"
+            f"{exp_info_line(fresh_user)}\n"
+            "⚡ Stamina: `-5`\n\n"
+            "Wróciłeś do karczmy. Poniżej są nowe misje."
+        )
+
+        quest_view = QuestView(fresh_user, quests, self.bot, footer=footer)
+        await message.edit(view=quest_view)
+
     async def return_to_tavern(self, interaction):
         user = await get_user(self.user_data['discord_id'])
+        await update_user(
+            self.user_data['discord_id'],
+            on_expedition=0,
+            expedition_start_time=0,
+            expedition_duration=0
+        )
         await regenerate_stamina(user['discord_id'])
         user = await get_user(user['discord_id'])
 
         quests = await get_random_quests(user['discord_id'])
-        quest_view = QuestView(user, quests, self.bot)
-
-        hp_bar = create_progress_bar(user['hp'], user['max_hp'], 15)
-        stamina_bar = create_progress_bar(user['stamina'], 100, 15)
-
-        embed = discord.Embed(
-            title="🍻 KARCZMA U PODPITEGO GOBLINA",
-            description="═══════════════════════════════════════",
-            color=0x6b4226
-        )
-        embed.add_field(
-            name="⚔️ STATYSTYKI",
-            value=f"**Lvl:** {user['level']} | **EXP:** {user['exp']}\n"
-                  f"**Atak:** {user['attack']} | **Obrona:** {user['defense']}",
-            inline=False
-        )
-        embed.add_field(name="❤️ ZDROWIE", value=f"{hp_bar}\n`{user['hp']}/{user['max_hp']} HP`", inline=False)
-        embed.add_field(name="⚡ STAMINA", value=f"{stamina_bar}\n`{user['stamina']}/100`", inline=False)
-        embed.add_field(name="💰 PORTFEL", value=f"**{user['gold']} złota**", inline=False)
-        embed.add_field(name="═══════════════════════════════════════", value="", inline=False)
-        embed.add_field(name="📜 DOSTĘPNE MISJE", value="", inline=False)
-
-        for i, q in enumerate(quests, 1):
-            difficulty = "🟢 ŁATWA" if q['gold'] < 100 else "🟡 ŚREDNIA" if q['gold'] < 300 else "🔴 TRUDNA"
-            embed.add_field(
-                name=f"**Misja {i}: {q['name']}**",
-                value=f"{difficulty}\n"
-                      f"⏱️ **Czas:** {q['duration']} min\n"
-                      f"💰 **Złoto:** {q['gold']}\n"
-                      f"✨ **EXP:** {q['exp']}",
-                inline=False
-            )
-
-        embed.set_footer(text="Powróciłeś do karczmy! Powodzenia, bohaterze!")
-        await interaction.response.edit_message(embed=embed, view=quest_view)
+        quest_view = QuestView(user, quests, self.bot, footer="Powróciłeś do karczmy! Powodzenia, bohaterze!")
+        await interaction.followup.edit_message(interaction.message.id, view=quest_view)

@@ -51,12 +51,14 @@ async def process_quest_selection(message: aio_pika.IncomingMessage):
         # Czekaj czas misji
         await asyncio.sleep(duration_minutes * 60)  # minuty na sekundy
         
-        # Po zakończeniu, odblokuj misję (nagrody przyznawane przez walkę)
+        # Worker tylko loguje zakończenie czasu.
+        # Odblokowanie gracza robi bot po walce, anulowaniu albo zakończeniu misji łatwej.
         user = await get_user(user_id)
-        if user:
-            await update_user(user_id, on_expedition=0, expedition_start_time=0, expedition_duration=0)
         
-        log_entry = f"QUEST_COMPLETED: {user_id} | Quest finished, rewards handled by fight"
+        if data.get('requires_combat', True):
+            log_entry = f"QUEST_COMPLETED: {user_id} | Quest finished, rewards handled by fight"
+        else:
+            log_entry = f"QUEST_COMPLETED: {user_id} | Easy timed quest finished, rewards handled by bot"
         logging.info(log_entry)
         print(f" [quest] Misja zakończona dla gracza {user_id}")
 
